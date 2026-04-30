@@ -4,14 +4,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import numpy as np
 import cv2
+import uvicorn
 import math
 import heapq
 import base64
 import requests
 
-# =========================
 # SCHEMA
-# =========================
 class NavRequest(BaseModel):
     image_url: str
     phone_width: int
@@ -20,9 +19,9 @@ class NavRequest(BaseModel):
     end: list[int]     # [x, y]
 
 
-# =========================
+
 # IMAGE PROCESSING
-# =========================
+
 def image_process(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
@@ -31,9 +30,9 @@ def image_process(img):
     return (walls > 0).astype(np.uint8)
 
 
-# =========================
+
 # DRAW PATH ON IMAGE
-# =========================
+
 def draw_path(img, path, start, end):
     out = img.copy()
     for i in range(len(path) - 1):
@@ -48,21 +47,22 @@ def draw_path(img, path, start, end):
     return out
 
 
-# =========================
+
 # ASTAR
-# =========================
+
 class Astar:
-    def __init__(self, grid, start, goal):
+    def __init__(self, grid, dist_transform, start, goal):
         self.grid = grid
+        self.dist_transform = dist_transform
         self.start = (start[1], start[0])  # (row, col)
         self.goal = (goal[1], goal[0])
 
     def heuristic(self, a, b):
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    # ----------------------------------
+    
     # LINE OF SIGHT CHECK
-    # ----------------------------------
+    
     def check_line(self, p1, p2):
         y1, x1 = p1
         y2, x2 = p2
@@ -75,11 +75,14 @@ class Astar:
             nx = int(x1 + i * (x2 - x1) / steps)
             if self.grid[ny, nx] != 0:
                 return False
+            # Keep line-of-sight slightly away from walls to prevent corner cutting
+            if self.dist_transform[ny, nx] < 8:
+                return False
         return True
 
-    # ----------------------------------
+    
     # REMOVE EXTRA POINTS (KEEP ONLY TURNS)
-    # ----------------------------------
+    
     def remove_collinear(self, path):
         if len(path) < 3:
             return path
@@ -101,9 +104,9 @@ class Astar:
         cleaned.append(path[-1])
         return cleaned
 
-    # ----------------------------------
+    
     # LINE-OF-SIGHT SMOOTHING (THETA*)
-    # ----------------------------------
+    
     def smooth_path(self, path):
         if len(path) < 3:
             return path
@@ -123,9 +126,9 @@ class Astar:
 
         return smoothed
 
-    # ----------------------------------
+    
     # ASTAR SEARCH
-    # ----------------------------------
+    
     def find_path(self):
         rows, cols = self.grid.shape
         pq = [(0, self.start, (0, 0))]
@@ -166,6 +169,14 @@ class Astar:
                 if prev != (0, 0) and prev != (dy, dx):
                     cost += 0.5
 
+                # Keep away from walls by penalizing low distance values
+                dist = self.dist_transform[ny, nx]
+                if dist > 0:
+                    penalty = 200.0 / (dist + 0.1)
+                else:
+                    penalty = 2000.0
+                cost += penalty
+
                 ng = g[cur] + cost
                 nxt = (ny, nx)
 
@@ -177,9 +188,9 @@ class Astar:
 
         return None
 
-# =========================
+
 # APP + CORS
-# =========================
+
 app = FastAPI()
 
 app.add_middleware(
@@ -192,9 +203,9 @@ app.add_middleware(
 )
 
 
-# =========================
+
 # ENDPOINT
-# =========================
+
 @app.post("/navigate")
 def navigate(req: NavRequest):
 
@@ -215,6 +226,10 @@ def navigate(req: NavRequest):
     # 3. Build obstacle map
     obstacle_map = image_process(phone_img)
 
+    # Calculate distance transform to keep path centered
+    free_space = (obstacle_map == 0).astype(np.uint8)
+    dist_transform = cv2.distanceTransform(free_space, cv2.DIST_L2, 5)
+
     # 4. Bounds + obstacle check
     sx, sy = req.start
     ex, ey = req.end
@@ -229,7 +244,7 @@ def navigate(req: NavRequest):
         return JSONResponse({"error": "End is inside an obstacle"}, status_code=400)
 
     # 5. Run A*
-    path = Astar(obstacle_map, req.start, req.end).find_path()
+    path = Astar(obstacle_map, dist_transform, req.start, req.end).find_path()
     if not path:
         return JSONResponse({"error": "No path found"}, status_code=404)
 
@@ -251,5 +266,5 @@ def navigate(req: NavRequest):
     })
 
 if __name__ == "__main__":
-    import uvicorn
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
